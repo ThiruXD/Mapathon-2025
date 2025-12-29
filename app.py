@@ -4,34 +4,37 @@ import matplotlib.pyplot as plt
 import rasterio
 from pystac_client import Client
 import planetary_computer as pc
+import geopandas as gpd
+import folium
+from streamlit_folium import st_folium
 
-# ----------------------------
-# STREAMLIT CONFIG
-# ----------------------------
-st.set_page_config(
-    page_title="Chennai Land Change Detection",
-    layout="wide"
-)
+# ---------------------------------
+# PAGE CONFIG
+# ---------------------------------
+st.set_page_config(page_title="Chennai Land Change Detection", layout="wide")
 
-st.title("🌍 Land Change Detection – Chennai, Tamil Nadu")
-st.caption(
-    "Fast, area-specific satellite analysis using open Sentinel-2 data"
-)
+st.title("🌍 Advanced Land Change Detection – Chennai, Tamil Nadu")
+st.caption("Python-based visual analytics using open Sentinel-2 satellite data")
 
-st.info(
-    "⏳ First load may take ~15 seconds due to satellite download. "
-    "Results are cached and load instantly afterwards."
-)
-
-# ----------------------------
-# CHENNAI BOUNDING BOX (SMALL AREA)
-# lon_min, lat_min, lon_max, lat_max
-# ----------------------------
+# ---------------------------------
+# CHENNAI BBOX
+# ---------------------------------
 CHENNAI_BBOX = [80.20, 12.90, 80.35, 13.15]
 
-# ----------------------------
-# CACHED NDVI FUNCTION
-# ----------------------------
+# ---------------------------------
+# LOAD CHENNAI BOUNDARY (GeoJSON)
+# ---------------------------------
+@st.cache_data
+def load_boundary():
+    return gpd.read_file(
+        "https://raw.githubusercontent.com/datameet/maps/master/Districts/Chennai.geojson"
+    )
+
+chennai_boundary = load_boundary()
+
+# ---------------------------------
+# NDVI FUNCTION (CACHED)
+# ---------------------------------
 @st.cache_data(show_spinner=False)
 def get_ndvi(date_range):
     catalog = Client.open(
@@ -45,56 +48,97 @@ def get_ndvi(date_range):
         query={"eo:cloud_cover": {"lt": 10}}
     )
 
-    items = list(search.get_items())
-    if len(items) == 0:
-        raise Exception("No satellite images found")
-
-    item = pc.sign(items[0])
+    item = pc.sign(list(search.get_items())[0])
 
     with rasterio.open(item.assets["B04"].href) as red_src:
         red = red_src.read(1).astype("float32")
-
     with rasterio.open(item.assets["B08"].href) as nir_src:
         nir = nir_src.read(1).astype("float32")
 
-    # 🔥 SPEED BOOST: downsample (every 4th pixel)
+    # Speed optimization
     red = red[::4, ::4]
     nir = nir[::4, ::4]
 
-    ndvi = (nir - red) / (nir + red + 1e-10)
-    return ndvi
+    return (nir - red) / (nir + red + 1e-10)
 
-# ----------------------------
-# PROCESSING
-# ----------------------------
-with st.spinner("Processing Chennai satellite data..."):
-    ndvi_2019 = get_ndvi("2019-01-01/2019-12-31")
-    ndvi_2024 = get_ndvi("2024-01-01/2024-12-31")
+# ---------------------------------
+# YEAR SLIDER (BEFORE / AFTER)
+# ---------------------------------
+year_before = st.slider("Select BEFORE year", 2018, 2022, 2019)
+year_after = st.slider("Select AFTER year", 2023, 2025, 2024)
 
-change_map = ndvi_2024 - ndvi_2019
+with st.spinner("Processing satellite data..."):
+    ndvi_before = get_ndvi(f"{year_before}-01-01/{year_before}-12-31")
+    ndvi_after = get_ndvi(f"{year_after}-01-01/{year_after}-12-31")
 
-# ----------------------------
-# VISUAL OUTPUT
-# ----------------------------
-col1, col2 = st.columns([2, 1])
+change = ndvi_after - ndvi_before
+
+# ---------------------------------
+# MAP WITH CHENNAI BOUNDARY
+# ---------------------------------
+st.subheader("🗺️ Chennai Boundary Overlay")
+
+m = folium.Map(location=[13.05, 80.27], zoom_start=10)
+folium.GeoJson(chennai_boundary, name="Chennai Boundary").add_to(m)
+st_folium(m, height=400, width=700)
+
+# ---------------------------------
+# VISUAL ANALYSIS
+# ---------------------------------
+col1, col2, col3 = st.columns(3)
 
 with col1:
-    st.subheader("🌱 NDVI Change Map (2019 → 2024)")
-    fig, ax = plt.subplots(figsize=(6, 6))
-    im = ax.imshow(change_map, cmap="RdYlGn", vmin=-0.5, vmax=0.5)
-    plt.colorbar(im, ax=ax, fraction=0.046)
+    st.subheader("NDVI (Before)")
+    st.image(ndvi_before, clamp=True)
+
+with col2:
+    st.subheader("NDVI (After)")
+    st.image(ndvi_after, clamp=True)
+
+with col3:
+    st.subheader("NDVI Change Map")
+    fig, ax = plt.subplots()
+    im = ax.imshow(change, cmap="RdYlGn", vmin=-0.5, vmax=0.5)
+    plt.colorbar(im, ax=ax)
     ax.axis("off")
     st.pyplot(fig)
 
-with col2:
-    st.subheader("📊 Change Statistics")
+# ---------------------------------
+# CLASSIFIED CHANGE MAP
+# ---------------------------------
+st.subheader("📌 Classified Land Change")
 
-    vegetation_loss = int(np.sum(change_map < -0.2))
-    vegetation_gain = int(np.sum(change_map > 0.2))
-    no_change = int(np.sum((-0.2 <= change_map) & (change_map <= 0.2)))
+classified = np.zeros(change.shape)
+classified[change < -0.2] = -1   # Loss
+classified[change > 0.2] = 1     # Gain
 
-    st.metric("Vegetation Loss Pixels", vegetation_loss)
-    st.metric("Vegetation Gain Pixels", vegetation_gain)
-    st.metric("No Significant Change", no_change)
+fig2, ax2 = plt.subplots()
+ax2.imshow(classified, cmap="bwr")
+ax2.set_title("Red = Loss | Blue = Gain")
+ax2.axis("off")
+st.pyplot(fig2)
 
-st.success("✅ Chennai land change analysis completed successfully!")
+# ---------------------------------
+# ANALYTICS
+# ---------------------------------
+total_pixels = change.size
+loss = np.sum(change < -0.2)
+gain = np.sum(change > 0.2)
+stable = total_pixels - (loss + gain)
+
+st.subheader("📊 Advanced Analytics")
+
+c1, c2, c3 = st.columns(3)
+c1.metric("Vegetation Loss (%)", f"{(loss/total_pixels)*100:.2f}%")
+c2.metric("Vegetation Gain (%)", f"{(gain/total_pixels)*100:.2f}%")
+c3.metric("Stable Area (%)", f"{(stable/total_pixels)*100:.2f}%")
+
+# Bar chart
+st.subheader("📈 Change Distribution")
+st.bar_chart({
+    "Loss": loss,
+    "Gain": gain,
+    "Stable": stable
+})
+
+st.success("✅ Advanced Chennai land change analysis completed!")
