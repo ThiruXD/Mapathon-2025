@@ -27,8 +27,11 @@ with st.sidebar:
     st.header("⚙️ Controls")
 
     CITY_FILES = {
+        "Bangalore": "geojson/BBMP.geojson",
         "Chennai": "geojson/chennai_boundary.geojson",
         "Coimbatore": "geojson/coimbatore_boundary.geojson",
+        "Hyderabad": "geojson/hyderabad.geojson",
+        "Mumbai": "geojson/mumbai.geojson",
     }
 
     city = st.selectbox("City", list(CITY_FILES.keys()))
