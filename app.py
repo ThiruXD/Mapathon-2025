@@ -8,33 +8,42 @@ import geopandas as gpd
 import folium
 from streamlit_folium import st_folium
 
-# ---------------------------------
+# -------------------------------------------------
 # PAGE CONFIG
-# ---------------------------------
-st.set_page_config(page_title="Chennai Land Change Detection", layout="wide")
+# -------------------------------------------------
+st.set_page_config(
+    page_title="Chennai Urban & Land Change Detection",
+    layout="wide"
+)
 
-st.title("🌍 Advanced Land Change Detection – Chennai, Tamil Nadu")
-st.caption("Python-based visual analytics using open Sentinel-2 satellite data")
+st.title("🌍 Urban & Land Change Detection – Chennai, Tamil Nadu")
+st.caption("Python-based satellite analytics using open Sentinel-2 data")
 
-# ---------------------------------
-# CHENNAI BBOX
-# ---------------------------------
+st.info(
+    "⏳ First run may take ~10–20 seconds due to satellite data download. "
+    "Results are cached and load instantly afterwards."
+)
+
+# -------------------------------------------------
+# CHENNAI BOUNDING BOX (SMALL AREA = FAST)
+# lon_min, lat_min, lon_max, lat_max
+# -------------------------------------------------
 CHENNAI_BBOX = [80.20, 12.90, 80.35, 13.15]
 
-# ---------------------------------
-# LOAD CHENNAI BOUNDARY (GeoJSON)
-# ---------------------------------
+# -------------------------------------------------
+# LOAD CHENNAI BOUNDARY (LOCAL FILE)
+# -------------------------------------------------
 @st.cache_data
 def load_boundary():
     return gpd.read_file("chennai_boundary.geojson")
 
 chennai_boundary = load_boundary()
 
-# ---------------------------------
-# NDVI FUNCTION (CACHED)
-# ---------------------------------
+# -------------------------------------------------
+# SATELLITE INDEX FUNCTION (NDVI + NDBI)
+# -------------------------------------------------
 @st.cache_data(show_spinner=False)
-def get_ndvi(date_range):
+def get_indices(date_range):
     catalog = Client.open(
         "https://planetarycomputer.microsoft.com/api/stac/v1"
     )
@@ -46,97 +55,162 @@ def get_ndvi(date_range):
         query={"eo:cloud_cover": {"lt": 10}}
     )
 
-    item = pc.sign(list(search.get_items())[0])
+    items = list(search.get_items())
+    if len(items) == 0:
+        raise RuntimeError("No satellite scenes found")
 
-    with rasterio.open(item.assets["B04"].href) as red_src:
-        red = red_src.read(1).astype("float32")
-    with rasterio.open(item.assets["B08"].href) as nir_src:
-        nir = nir_src.read(1).astype("float32")
+    item = pc.sign(items[0])
 
-    # Speed optimization
-    red = red[::4, ::4]
-    nir = nir[::4, ::4]
+    def read_band(band):
+        with rasterio.open(item.assets[band].href) as src:
+            return src.read(1).astype("float32")[::4, ::4]  # downsample
 
-    return (nir - red) / (nir + red + 1e-10)
+    red = read_band("B04")
+    nir = read_band("B08")
+    swir = read_band("B11")
 
-# ---------------------------------
-# YEAR SLIDER (BEFORE / AFTER)
-# ---------------------------------
+    ndvi = (nir - red) / (nir + red + 1e-10)
+    ndbi = (swir - nir) / (swir + nir + 1e-10)
+
+    return ndvi, ndbi
+
+# -------------------------------------------------
+# YEAR SLIDERS (BEFORE / AFTER)
+# -------------------------------------------------
 year_before = st.slider("Select BEFORE year", 2018, 2022, 2019)
 year_after = st.slider("Select AFTER year", 2023, 2025, 2024)
 
-with st.spinner("Processing satellite data..."):
-    ndvi_before = get_ndvi(f"{year_before}-01-01/{year_before}-12-31")
-    ndvi_after = get_ndvi(f"{year_after}-01-01/{year_after}-12-31")
+with st.spinner("Processing Chennai satellite data..."):
+    ndvi_before, ndbi_before = get_indices(
+        f"{year_before}-01-01/{year_before}-12-31"
+    )
+    ndvi_after, ndbi_after = get_indices(
+        f"{year_after}-01-01/{year_after}-12-31"
+    )
 
-change = ndvi_after - ndvi_before
+veg_change = ndvi_after - ndvi_before
+urban_change = ndbi_after - ndbi_before
 
-# ---------------------------------
+# -------------------------------------------------
 # MAP WITH CHENNAI BOUNDARY
-# ---------------------------------
-st.subheader("🗺️ Chennai Boundary Overlay")
+# -------------------------------------------------
+st.subheader("🗺️ Chennai Administrative Boundary")
 
 m = folium.Map(location=[13.05, 80.27], zoom_start=10)
-folium.GeoJson(chennai_boundary, name="Chennai Boundary").add_to(m)
+folium.GeoJson(
+    chennai_boundary,
+    name="Chennai Boundary",
+    style_function=lambda x: {
+        "fillOpacity": 0,
+        "color": "blue",
+        "weight": 2
+    }
+).add_to(m)
+
 st_folium(m, height=400, width=700)
 
-# ---------------------------------
-# VISUAL ANALYSIS
-# ---------------------------------
+# -------------------------------------------------
+# VISUAL COMPARISON
+# -------------------------------------------------
+st.subheader("🖼️ Before / After Visual Comparison")
+
 col1, col2, col3 = st.columns(3)
 
 with col1:
-    st.subheader("NDVI (Before)")
+    st.caption("NDVI (Before)")
     st.image(ndvi_before, clamp=True)
 
 with col2:
-    st.subheader("NDVI (After)")
+    st.caption("NDVI (After)")
     st.image(ndvi_after, clamp=True)
 
 with col3:
-    st.subheader("NDVI Change Map")
     fig, ax = plt.subplots()
-    im = ax.imshow(change, cmap="RdYlGn", vmin=-0.5, vmax=0.5)
+    im = ax.imshow(veg_change, cmap="RdYlGn", vmin=-0.5, vmax=0.5)
     plt.colorbar(im, ax=ax)
+    ax.set_title("Vegetation Change")
     ax.axis("off")
     st.pyplot(fig)
 
-# ---------------------------------
-# CLASSIFIED CHANGE MAP
-# ---------------------------------
-st.subheader("📌 Classified Land Change")
-
-classified = np.zeros(change.shape)
-classified[change < -0.2] = -1   # Loss
-classified[change > 0.2] = 1     # Gain
+# -------------------------------------------------
+# URBAN GROWTH (ROADS + BUILDINGS)
+# -------------------------------------------------
+st.subheader("🏗️ Urban Expansion (Buildings & Roads – NDBI)")
 
 fig2, ax2 = plt.subplots()
-ax2.imshow(classified, cmap="bwr")
-ax2.set_title("Red = Loss | Blue = Gain")
+im2 = ax2.imshow(urban_change, cmap="inferno", vmin=-0.3, vmax=0.3)
+plt.colorbar(im2, ax=ax2, label="Built-up Change (NDBI)")
 ax2.axis("off")
 st.pyplot(fig2)
 
-# ---------------------------------
-# ANALYTICS
-# ---------------------------------
-total_pixels = change.size
-loss = np.sum(change < -0.2)
-gain = np.sum(change > 0.2)
-stable = total_pixels - (loss + gain)
+# -------------------------------------------------
+# CLASSIFIED MAPS
+# -------------------------------------------------
+st.subheader("📌 Classified Change Maps")
 
+veg_class = np.zeros(veg_change.shape)
+veg_class[veg_change < -0.2] = -1
+veg_class[veg_change > 0.2] = 1
+
+urb_class = np.zeros(urban_change.shape)
+urb_class[urban_change > 0.2] = 1
+
+col4, col5 = st.columns(2)
+
+with col4:
+    fig3, ax3 = plt.subplots()
+    ax3.imshow(veg_class, cmap="bwr")
+    ax3.set_title("Vegetation Loss / Gain")
+    ax3.axis("off")
+    st.pyplot(fig3)
+
+with col5:
+    fig4, ax4 = plt.subplots()
+    ax4.imshow(urb_class, cmap="Reds")
+    ax4.set_title("Urban Growth Zones")
+    ax4.axis("off")
+    st.pyplot(fig4)
+
+# -------------------------------------------------
+# ADVANCED ANALYTICS
+# -------------------------------------------------
 st.subheader("📊 Advanced Analytics")
 
-c1, c2, c3 = st.columns(3)
-c1.metric("Vegetation Loss (%)", f"{(loss/total_pixels)*100:.2f}%")
-c2.metric("Vegetation Gain (%)", f"{(gain/total_pixels)*100:.2f}%")
-c3.metric("Stable Area (%)", f"{(stable/total_pixels)*100:.2f}%")
+total_pixels = veg_change.size
+veg_loss = np.sum(veg_change < -0.2)
+veg_gain = np.sum(veg_change > 0.2)
+urban_growth = np.sum(urban_change > 0.2)
 
-# Bar chart
-st.subheader("📈 Change Distribution")
+c1, c2, c3 = st.columns(3)
+c1.metric("Vegetation Loss (%)", f"{(veg_loss/total_pixels)*100:.2f}%")
+c2.metric("Vegetation Gain (%)", f"{(veg_gain/total_pixels)*100:.2f}%")
+c3.metric("Urban Growth Pixels", int(urban_growth))
+
 st.bar_chart({
-    "Loss": loss,
-    "Gain": gain,
-    "Stable": stable
+    "Vegetation Loss": veg_loss,
+    "Vegetation Gain": veg_gain,
+    "Urban Growth": urban_growth
 })
 
-st.success("✅ Advanced Chennai land change analysis completed!")
+# -------------------------------------------------
+# ISRO / NRSC CITATION
+# -------------------------------------------------
+st.divider()
+st.subheader("📚 Data Sources & Scientific References")
+
+st.markdown("""
+**Satellite Data**
+- Sentinel-2 Level-2A (ESA Copernicus Programme)
+
+**Indian Remote Sensing Context**
+- Indian Space Research Organisation (ISRO)
+- National Remote Sensing Centre (NRSC), Hyderabad
+
+**Methodologies**
+- NDVI for vegetation monitoring
+- NDBI for built-up (roads & buildings) detection
+- Standard urban remote sensing techniques
+""")
+
+st.success("✅ Full Chennai land & urban change analysis completed!")
+
