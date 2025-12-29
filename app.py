@@ -26,9 +26,7 @@ CHENNAI_BBOX = [80.20, 12.90, 80.35, 13.15]
 # ---------------------------------
 @st.cache_data
 def load_boundary():
-    return gpd.read_file(
-        "https://raw.githubusercontent.com/datameet/maps/master/Districts/Chennai.geojson"
-    )
+    return gpd.read_file("chennai_boundary.geojson")
 
 chennai_boundary = load_boundary()
 
