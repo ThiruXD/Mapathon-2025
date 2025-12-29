@@ -7,6 +7,7 @@ import planetary_computer as pc
 import geopandas as gpd
 import folium
 from streamlit_folium import st_folium
+from rasterio.enums import Resampling
 
 # -------------------------------------------------
 # PAGE CONFIG
@@ -61,14 +62,31 @@ def get_indices(date_range):
 
     item = pc.sign(items[0])
 
-    def read_band(band):
-        with rasterio.open(item.assets[band].href) as src:
-            return src.read(1).astype("float32")[::4, ::4]  # downsample
+    # --- Read RED (10m)
+    with rasterio.open(item.assets["B04"].href) as src:
+        red = src.read(
+            1,
+            out_shape=(src.height // 2, src.width // 2),
+            resampling=Resampling.average
+        ).astype("float32")
 
-    red = read_band("B04")
-    nir = read_band("B08")
-    swir = read_band("B11")
+    # --- Read NIR (10m)
+    with rasterio.open(item.assets["B08"].href) as src:
+        nir = src.read(
+            1,
+            out_shape=(src.height // 2, src.width // 2),
+            resampling=Resampling.average
+        ).astype("float32")
 
+    # --- Read SWIR (20m → resampled to 10m)
+    with rasterio.open(item.assets["B11"].href) as src:
+        swir = src.read(
+            1,
+            out_shape=(nir.shape[0], nir.shape[1]),
+            resampling=Resampling.bilinear
+        ).astype("float32")
+
+    # --- INDICES
     ndvi = (nir - red) / (nir + red + 1e-10)
     ndbi = (swir - nir) / (swir + nir + 1e-10)
 
