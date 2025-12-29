@@ -4,3 +4,6 @@ matplotlib
 rasterio
 pystac-client
 planetary-computer
+folium
+streamlit-folium
+geopandas
