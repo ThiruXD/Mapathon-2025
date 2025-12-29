@@ -58,6 +58,20 @@ BASEMAPS = {
 
 basemap = BASEMAPS[basemap_name]
 
+
+def match_shape(src, target_shape):
+    """
+    Downsample src array to match target_shape using block averaging.
+    """
+    sh = (
+        target_shape[0],
+        src.shape[0] // target_shape[0],
+        target_shape[1],
+        src.shape[1] // target_shape[1],
+    )
+    return src[:sh[0]*sh[1], :sh[2]*sh[3]].reshape(sh).mean(-1).mean(1)
+
+
 # ==================================================
 # LOAD CITY & AUTO BBOX
 # ==================================================
@@ -177,7 +191,11 @@ veg_gain = ndvi_change > ndvi_thresh
 urban = ndbi_change > ndbi_thresh
 
 # Road proxy (scientific)
-roads_proxy = (ndbi_change > ndbi_thresh) & (ndvi_change < 0.05)
+# Match NDVI resolution to NDBI resolution
+ndvi_matched = match_shape(ndvi_change, ndbi_change.shape)
+
+# Road-dominant urban expansion proxy
+roads_proxy = (ndbi_change > ndbi_thresh) & (ndvi_matched < 0.05)
 
 ward_geo = build_ward_geojson(boundary, ndvi_change, ndbi_change, bbox)
 
