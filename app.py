@@ -5,22 +5,19 @@ from rasterio.enums import Resampling
 from pystac_client import Client
 import planetary_computer as pc
 import leafmap.foliumap as leafmap
-from shapely.geometry import shape, Polygon, mapping
+from shapely.geometry import shape
 import json
 import pandas as pd
 
 # ==================================================
 # PAGE CONFIG (MOBILE FRIENDLY)
 # ==================================================
-st.set_page_config(
-    page_title="Urban & Environmental Intelligence Dashboard",
-    layout="wide"
-)
+st.set_page_config(page_title="Urban & Environmental Intelligence Dashboard", layout="wide")
 
 st.title("🌍 Urban & Environmental Intelligence Dashboard")
 st.caption(
-    "Interactive GIS dashboard using satellite data + open transport layers "
-    "(Vegetation • Buildings • Roads)"
+    "Satellite-based land-use change detection with open infrastructure reference layers "
+    "(Vegetation • Urban • Roads / Rail)"
 )
 
 # ==================================================
@@ -31,49 +28,37 @@ with st.sidebar:
 
     CITY_FILES = {
         "Chennai": "geojson/chennai_boundary.geojson",
-        "Coimbatore": "geojson/coimbatore_boundary.geojson"
+        "Coimbatore": "geojson/coimbatore_boundary.geojson",
     }
 
     city = st.selectbox("City", list(CITY_FILES.keys()))
-    year = st.slider("Analysis year (vs previous)", 2019, 2025, 2024)
+    year = st.slider("Analysis year (compared with previous year)", 2019, 2025, 2024)
 
-    ndvi_thresh = st.slider("Vegetation change threshold", 0.1, 0.4, 0.2, 0.05)
-    ndbi_thresh = st.slider("Urban growth threshold", 0.1, 0.4, 0.2, 0.05)
+    ndvi_thresh = st.slider("Vegetation change threshold (NDVI)", 0.1, 0.4, 0.2, 0.05)
+    ndbi_thresh = st.slider("Urban growth threshold (NDBI)", 0.1, 0.4, 0.2, 0.05)
 
     basemap_name = st.selectbox(
-        "Basemap",
-        ["OpenStreetMap", "CartoDB Positron", "Stamen Terrain"]
+        "Basemap (roads / rail visible)",
+        [
+            "OpenStreetMap",
+            "CartoDB Voyager (Transport)",
+            "CartoDB Positron (Clean)",
+        ],
     )
 
-    show_osm_transport = st.checkbox("Show OSM Roads / Rail / Metro", value=True)
-
 # ==================================================
-# BASEMAP FIX (IMPORTANT)
+# BASEMAP MAPPING (FIXED ATTRIBUTION)
 # ==================================================
 BASEMAPS = {
-    "OpenStreetMap": "OpenStreetMap",
-    "CartoDB Positron": "CartoDB positron",
-    "Stamen Terrain": "Stamen Terrain"
+    "OpenStreetMap": "OpenStreetMap.Mapnik",
+    "CartoDB Voyager (Transport)": "CartoDB Voyager",
+    "CartoDB Positron (Clean)": "CartoDB positron",
 }
 
 basemap = BASEMAPS[basemap_name]
 
-
-def match_shape(src, target_shape):
-    """
-    Downsample src array to match target_shape using block averaging.
-    """
-    sh = (
-        target_shape[0],
-        src.shape[0] // target_shape[0],
-        target_shape[1],
-        src.shape[1] // target_shape[1],
-    )
-    return src[:sh[0]*sh[1], :sh[2]*sh[3]].reshape(sh).mean(-1).mean(1)
-
-
 # ==================================================
-# LOAD CITY & AUTO BBOX
+# LOAD CITY GEOJSON & AUTO BBOX
 # ==================================================
 @st.cache_data
 def load_city(path):
@@ -95,7 +80,7 @@ def load_city(path):
     return data, bbox
 
 # ==================================================
-# SATELLITE PROCESSING
+# SATELLITE PROCESSING (SENTINEL-2)
 # ==================================================
 @st.cache_data(show_spinner=False)
 def compute_change(bbox, y1, y2):
@@ -106,42 +91,46 @@ def compute_change(bbox, y1, y2):
             collections=["sentinel-2-l2a"],
             bbox=bbox,
             datetime=f"{year}-01-01/{year}-12-31",
-            query={"eo:cloud_cover": {"lt": 10}}
+            query={"eo:cloud_cover": {"lt": 10}},
         )
         return pc.sign(list(s.items())[0])
 
-    b, a = scene(y1), scene(y2)
+    before = scene(y1)
+    after = scene(y2)
 
     def read(band, item, scale):
         with rasterio.open(item.assets[band].href) as src:
             return src.read(
                 1,
                 out_shape=(src.height // scale, src.width // scale),
-                resampling=Resampling.average
+                resampling=Resampling.average,
             ).astype("float32")
 
-    red_b, nir_b = read("B04", b, 4), read("B08", b, 4)
-    red_a, nir_a = read("B04", a, 4), read("B08", a, 4)
-    swir_b, swir_a = read("B11", b, 8), read("B11", a, 8)
+    red_b, nir_b = read("B04", before, 4), read("B08", before, 4)
+    red_a, nir_a = read("B04", after, 4), read("B08", after, 4)
+    swir_b, swir_a = read("B11", before, 8), read("B11", after, 8)
 
-    ndvi_change = (nir_a - red_a)/(nir_a + red_a + 1e-10) - \
-                  (nir_b - red_b)/(nir_b + red_b + 1e-10)
+    ndvi_change = (nir_a - red_a) / (nir_a + red_a + 1e-10) - (
+        (nir_b - red_b) / (nir_b + red_b + 1e-10)
+    )
 
-    ndbi_change = (swir_a - nir_a[:swir_a.shape[0], :swir_a.shape[1]]) / \
-                  (swir_a + nir_a[:swir_a.shape[0], :swir_a.shape[1]] + 1e-10) - \
-                  (swir_b - nir_b[:swir_b.shape[0], :swir_b.shape[1]]) / \
-                  (swir_b + nir_b[:swir_b.shape[0], :swir_b.shape[1]] + 1e-10)
+    ndbi_change = (swir_a - nir_a[: swir_a.shape[0], : swir_a.shape[1]]) / (
+        swir_a + nir_a[: swir_a.shape[0], : swir_a.shape[1]] + 1e-10
+    ) - (
+        (swir_b - nir_b[: swir_b.shape[0], : swir_b.shape[1]])
+        / (swir_b + nir_b[: swir_b.shape[0], : swir_b.shape[1]] + 1e-10)
+    )
 
     return ndvi_change, ndbi_change
 
 # ==================================================
-# SAFE % CALCULATION (NO NaN)
+# SAFE PERCENT (NO NaN)
 # ==================================================
 def safe_percent(mask):
     return (np.count_nonzero(mask) / mask.size) * 100 if mask.size else 0.0
 
 # ==================================================
-# WARD POPUPS (CHENNAI + COIMBATORE SAFE)
+# WARD-WISE POPUPS (CHENNAI + COIMBATORE SAFE)
 # ==================================================
 def build_ward_geojson(boundary, ndvi, ndbi, bbox):
     h, w = ndvi.shape
@@ -156,8 +145,8 @@ def build_ward_geojson(boundary, ndvi, ndbi, bbox):
         y0 = int((miny - bbox[1]) / (bbox[3] - bbox[1]) * h)
         y1 = int((maxy - bbox[1]) / (bbox[3] - bbox[1]) * h)
 
-        zone_ndvi = ndvi[max(0,y0):min(h,y1), max(0,x0):min(w,x1)]
-        zone_ndbi = ndbi[max(0,y0):min(h,y1), max(0,x0):min(w,x1)]
+        zone_ndvi = ndvi[max(0, y0) : min(h, y1), max(0, x0) : min(w, x1)]
+        zone_ndbi = ndbi[max(0, y0) : min(h, y1), max(0, x0) : min(w, x1)]
 
         props = feat.get("properties", {})
         zone_name = props.get("zone_name", props.get("Zone", "N/A"))
@@ -184,18 +173,11 @@ def build_ward_geojson(boundary, ndvi, ndbi, bbox):
 boundary, bbox = load_city(CITY_FILES[city])
 
 with st.spinner("Running satellite analysis…"):
-    ndvi_change, ndbi_change = compute_change(bbox, year-1, year)
+    ndvi_change, ndbi_change = compute_change(bbox, year - 1, year)
 
 veg_loss = ndvi_change < -ndvi_thresh
 veg_gain = ndvi_change > ndvi_thresh
 urban = ndbi_change > ndbi_thresh
-
-# Road proxy (scientific)
-# Match NDVI resolution to NDBI resolution
-ndvi_matched = match_shape(ndvi_change, ndbi_change.shape)
-
-# Road-dominant urban expansion proxy
-roads_proxy = (ndbi_change > ndbi_thresh) & (ndvi_matched < 0.05)
 
 ward_geo = build_ward_geojson(boundary, ndvi_change, ndbi_change, bbox)
 
@@ -203,23 +185,19 @@ ward_geo = build_ward_geojson(boundary, ndvi_change, ndbi_change, bbox)
 # INTERACTIVE MAP (MOBILE SAFE HEIGHT)
 # ==================================================
 m = leafmap.Map(
-    center=[(bbox[1]+bbox[3])/2, (bbox[0]+bbox[2])/2],
+    center=[(bbox[1] + bbox[3]) / 2, (bbox[0] + bbox[2]) / 2],
     zoom=11,
-    tiles=basemap
+    tiles=basemap,
 )
 
-m.add_geojson(ward_geo, layer_name="Wards (Click for stats)")
-
-if show_osm_transport:
-    m.add_osm_transport(layer_name="OSM Roads / Rail / Metro")
-
+m.add_geojson(ward_geo, layer_name="Wards (click for stats)")
 m.add_layer_control()
 m.to_streamlit(height=420)
 
 # ==================================================
 # ANALYTICS
 # ==================================================
-st.subheader("📊 City Analytics")
+st.subheader("📊 City-Level Analytics")
 
 c1, c2, c3 = st.columns(3)
 c1.metric("Vegetation Loss (%)", f"{safe_percent(veg_loss):.2f}%")
@@ -229,28 +207,31 @@ c3.metric("Urban Expansion (%)", f"{safe_percent(urban):.2f}%")
 # ==================================================
 # DOWNLOAD / EXPORT
 # ==================================================
-st.subheader("⬇️ Download")
+st.subheader("⬇️ Download & Export")
 
-df = pd.DataFrame({
-    "Metric": ["Vegetation Loss", "Vegetation Gain", "Urban Expansion"],
-    "Percentage (%)": [
-        safe_percent(veg_loss),
-        safe_percent(veg_gain),
-        safe_percent(urban)
-    ]
-})
+summary_df = pd.DataFrame(
+    {
+        "Metric": ["Vegetation Loss", "Vegetation Gain", "Urban Expansion"],
+        "Percentage (%)": [
+            safe_percent(veg_loss),
+            safe_percent(veg_gain),
+            safe_percent(urban),
+        ],
+    }
+)
 
 st.download_button(
     "Download City Analytics (CSV)",
-    df.to_csv(index=False),
-    "city_analytics.csv"
+    summary_df.to_csv(index=False),
+    "city_analytics.csv",
+    "text/csv",
 )
 
 st.download_button(
-    "Download Ward GeoJSON",
+    "Download Ward GeoJSON (with popups)",
     json.dumps(ward_geo),
     "ward_analysis.geojson",
-    "application/geo+json"
+    "application/geo+json",
 )
 
-st.success("✅ Fully stable advanced GIS dashboard ready")
+st.success("✅ Final stable, mobile-friendly GIS dashboard ready for submission")
