@@ -19,8 +19,8 @@ st.set_page_config(
 
 st.title("🌍 Urban & Environmental Intelligence Dashboard")
 st.caption(
-    "Satellite-based land-use change detection + OpenStreetMap transport reference layers "
-    "(Vegetation • Urban • Roads / Rail / Metro)"
+    "Satellite-based land-use change detection (NDVI & NDBI) "
+    "with ward-level analytics and hotspot detection"
 )
 
 # ==================================================
@@ -38,37 +38,11 @@ with st.sidebar:
     city = st.selectbox("City", list(CITY_FILES.keys()))
     year = st.slider("Analysis year (vs previous year)", 2019, 2025, 2024)
 
-    ndvi_thresh = st.slider("Vegetation threshold (NDVI)", 0.1, 0.4, 0.2, 0.05)
-    ndbi_thresh = st.slider("Urban threshold (NDBI)", 0.1, 0.4, 0.2, 0.05)
-
-    analysis_basemap = st.selectbox(
-        "Analysis Map Basemap",
-        ["CartoDB Positron", "OpenStreetMap"]
-    )
-
-    transport_basemap = st.selectbox(
-        "Transport Map Basemap (OpenStreetMap)",
-        [
-            "OpenStreetMap Standard",
-            "CartoDB Voyager (Transport)",
-        ]
-    )
+    ndvi_thresh = st.slider("Vegetation change threshold (NDVI)", 0.1, 0.4, 0.2, 0.05)
+    ndbi_thresh = st.slider("Urban growth threshold (NDBI)", 0.1, 0.4, 0.2, 0.05)
 
 # ==================================================
-# BASEMAP DICTS
-# ==================================================
-ANALYSIS_BASEMAPS = {
-    "OpenStreetMap": "OpenStreetMap.Mapnik",
-    "CartoDB Positron": "CartoDB positron",
-}
-
-TRANSPORT_BASEMAPS = {
-    "OpenStreetMap Standard": "OpenStreetMap.Mapnik",
-    "CartoDB Voyager (Transport)": "CartoDB Voyager",
-}
-
-# ==================================================
-# LOAD CITY GEOJSON & AUTO BBOX
+# LOAD CITY GEOJSON & BBOX
 # ==================================================
 @st.cache_data
 def load_city(path):
@@ -85,28 +59,26 @@ def load_city(path):
 
     lons = [c[0] for c in coords]
     lats = [c[1] for c in coords]
-
     bbox = [min(lons), min(lats), max(lons), max(lats)]
     return data, bbox
 
 # ==================================================
-# SATELLITE PROCESSING (SENTINEL-2)
+# SATELLITE PROCESSING
 # ==================================================
 @st.cache_data(show_spinner=False)
 def compute_change(bbox, y1, y2):
     catalog = Client.open("https://planetarycomputer.microsoft.com/api/stac/v1")
 
-    def get_scene(year):
-        search = catalog.search(
+    def scene(year):
+        s = catalog.search(
             collections=["sentinel-2-l2a"],
             bbox=bbox,
             datetime=f"{year}-01-01/{year}-12-31",
             query={"eo:cloud_cover": {"lt": 10}},
         )
-        return pc.sign(list(search.items())[0])
+        return pc.sign(list(s.items())[0])
 
-    before = get_scene(y1)
-    after = get_scene(y2)
+    before, after = scene(y1), scene(y2)
 
     def read(band, item, scale):
         with rasterio.open(item.assets[band].href) as src:
@@ -140,11 +112,13 @@ def safe_percent(mask):
     return (np.count_nonzero(mask) / mask.size) * 100 if mask.size else 0.0
 
 # ==================================================
-# WARD-WISE POPUPS (URBAN FIXED)
+# WARD ANALYTICS + HOTSPOTS
 # ==================================================
-def build_ward_geojson(boundary, ndvi, ndbi, bbox):
+def analyze_wards(boundary, ndvi, ndbi, bbox):
     hv, wv = ndvi.shape
     hu, wu = ndbi.shape
+
+    rows = []
     features = []
 
     for feat in boundary["features"]:
@@ -164,97 +138,91 @@ def build_ward_geojson(boundary, ndvi, ndbi, bbox):
         zone_ndvi = ndvi[max(0,y0v):min(hv,y1v), max(0,x0v):min(wv,x1v)]
         zone_ndbi = ndbi[max(0,y0u):min(hu,y1u), max(0,x0u):min(wu,x1u)]
 
+        veg_loss = safe_percent(zone_ndvi < -ndvi_thresh)
+        urban = safe_percent(zone_ndbi > ndbi_thresh)
+
+        ward_name = feat.get("properties", {}).get("ward_no", "Unknown")
+
+        rows.append({
+            "Ward": ward_name,
+            "Vegetation Loss (%)": veg_loss,
+            "Urban Expansion (%)": urban,
+        })
+
         feat["properties"]["popup"] = (
-            f"<b>Vegetation Loss:</b> {safe_percent(zone_ndvi < -ndvi_thresh):.2f}%<br>"
-            f"<b>Vegetation Gain:</b> {safe_percent(zone_ndvi > ndvi_thresh):.2f}%<br>"
-            f"<b>Urban Expansion:</b> {safe_percent(zone_ndbi > ndbi_thresh):.2f}%"
+            f"<b>Ward:</b> {ward_name}<br>"
+            f"<b>Vegetation Loss:</b> {veg_loss:.2f}%<br>"
+            f"<b>Urban Expansion:</b> {urban:.2f}%"
         )
 
         features.append(feat)
 
-    return {"type": "FeatureCollection", "features": features}
+    return pd.DataFrame(rows), {"type": "FeatureCollection", "features": features}
 
 # ==================================================
-# RUN PIPELINE
+# RUN
 # ==================================================
 boundary, bbox = load_city(CITY_FILES[city])
-ndvi_change, ndbi_change = compute_change(bbox, year - 1, year)
-ward_geo = build_ward_geojson(boundary, ndvi_change, ndbi_change, bbox)
+ndvi_change, ndbi_change = compute_change(bbox, year-1, year)
 
-veg_loss = ndvi_change < -ndvi_thresh
-veg_gain = ndvi_change > ndvi_thresh
-urban = ndbi_change > ndbi_thresh
+ward_df, ward_geo = analyze_wards(boundary, ndvi_change, ndbi_change, bbox)
 
 # ==================================================
-# MAP 1: SATELLITE ANALYSIS MAP
+# MAP (OPENSTREETMAP DEFAULT)
 # ==================================================
-st.subheader("🛰️ Land-use Change Map")
-
-analysis_map = leafmap.Map(
+m = leafmap.Map(
     center=[(bbox[1]+bbox[3])/2, (bbox[0]+bbox[2])/2],
     zoom=11,
-    tiles=ANALYSIS_BASEMAPS[analysis_basemap],
+    tiles="OpenStreetMap.Mapnik"
 )
 
-analysis_map.add_geojson(ward_geo, layer_name="Wards (click for stats)")
-analysis_map.add_layer_control()
-analysis_map.to_streamlit(height=420)
+m.add_geojson(ward_geo, layer_name="Wards (Click)")
+m.add_layer_control()
+m.to_streamlit(height=420)
 
 # ==================================================
-# MAP 2: TRANSPORT MAP (OPENSTREETMAP.ORG)
+# KPIs
 # ==================================================
-st.subheader("🚦 Transport Infrastructure Map (OpenStreetMap)")
+st.subheader("📊 City-Level KPIs")
 
-transport_map = leafmap.Map(
-    center=[(bbox[1]+bbox[3])/2, (bbox[0]+bbox[2])/2],
-    zoom=11,
-)
-
-transport_map.add_tile_layer(
-    url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
-    name="OpenStreetMap Standard",
-    attribution="© OpenStreetMap contributors"
-)
-
-transport_map.add_tile_layer(
-    url="https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}.png",
-    name="CartoDB Voyager (Transport)",
-    attribution="© OpenStreetMap contributors © CARTO"
-)
-
-transport_map.add_layer_control()
-transport_map.to_streamlit(height=420)
+c1, c2 = st.columns(2)
+c1.metric("Avg Vegetation Loss (%)", f"{ward_df['Vegetation Loss (%)'].mean():.2f}")
+c2.metric("Avg Urban Expansion (%)", f"{ward_df['Urban Expansion (%)'].mean():.2f}")
 
 # ==================================================
-# ANALYTICS
+# WARD RANKINGS
 # ==================================================
-st.subheader("📊 City Analytics")
+st.subheader("🏆 Ward Rankings")
 
-c1, c2, c3 = st.columns(3)
-c1.metric("Vegetation Loss (%)", f"{safe_percent(veg_loss):.2f}%")
-c2.metric("Vegetation Gain (%)", f"{safe_percent(veg_gain):.2f}%")
-c3.metric("Urban Expansion (%)", f"{safe_percent(urban):.2f}%")
+st.markdown("### 🔴 Top 10 Vegetation Loss Wards")
+st.dataframe(ward_df.sort_values("Vegetation Loss (%)", ascending=False).head(10))
+
+st.markdown("### 🏗️ Top 10 Urban Expansion Wards")
+st.dataframe(ward_df.sort_values("Urban Expansion (%)", ascending=False).head(10))
+
+# ==================================================
+# HOTSPOTS
+# ==================================================
+st.subheader("🔥 Hotspot Detection")
+
+veg_hotspots = ward_df[ward_df["Vegetation Loss (%)"] > ward_df["Vegetation Loss (%)"].quantile(0.9)]
+urban_hotspots = ward_df[ward_df["Urban Expansion (%)"] > ward_df["Urban Expansion (%)"].quantile(0.9)]
+
+st.markdown("### Vegetation Loss Hotspots")
+st.dataframe(veg_hotspots)
+
+st.markdown("### Urban Expansion Hotspots")
+st.dataframe(urban_hotspots)
 
 # ==================================================
 # DOWNLOAD
 # ==================================================
-st.subheader("⬇️ Download & Export")
+st.subheader("⬇️ Download")
 
-df = pd.DataFrame({
-    "Metric": ["Vegetation Loss", "Vegetation Gain", "Urban Expansion"],
-    "Percentage (%)": [
-        safe_percent(veg_loss),
-        safe_percent(veg_gain),
-        safe_percent(urban),
-    ],
-})
-
-st.download_button("Download City Analytics (CSV)", df.to_csv(index=False), "city_analytics.csv")
+st.download_button("Download Ward Analytics (CSV)", ward_df.to_csv(index=False), "ward_analytics.csv")
 st.download_button(
     "Download Ward GeoJSON",
     json.dumps(ward_geo),
     "ward_analysis.geojson",
     "application/geo+json"
 )
-
-st.success("✅ All past features integrated successfully. OpenStreetMap transport map working.")
