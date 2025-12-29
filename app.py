@@ -7,45 +7,56 @@ import planetary_computer as pc
 import leafmap.foliumap as leafmap
 from shapely.geometry import Polygon, mapping
 import json
+import math
 
 # ==================================================
-# PAGE CONFIG (MOBILE FRIENDLY)
+# PAGE CONFIG (MOBILE FIRST)
 # ==================================================
 st.set_page_config(
-    page_title="Urban & Environmental Change Dashboard",
+    page_title="Urban & Environmental Intelligence Dashboard",
     layout="wide"
 )
 
-st.title("🌍 Urban & Environmental Change Dashboard (India)")
-st.caption("Real-time interactive geospatial analytics using open satellite data")
+st.title("🌍 Urban & Environmental Intelligence Dashboard")
+st.caption(
+    "Interactive smart-city analytics using open satellite data "
+    "(Vegetation • Buildings • Roads)"
+)
 
 # ==================================================
-# SIDEBAR CONTROLS (MOBILE FRIENDLY)
+# SIDEBAR – CONTROL PANEL
 # ==================================================
 with st.sidebar:
-    st.header("⚙️ Controls")
+    st.header("⚙️ Dashboard Controls")
 
     CITY_FILES = {
         "Chennai": "geojson/chennai_boundary.geojson",
         "Coimbatore": "geojson/coimbatore_boundary.geojson"
     }
 
-    city = st.selectbox("City", list(CITY_FILES.keys()))
-    year_before = st.selectbox("Before year", [2019, 2020, 2021, 2022])
-    year_after = st.selectbox("After year", [2023, 2024, 2025])
+    city = st.selectbox("Select City", list(CITY_FILES.keys()))
+    year_before = st.selectbox("Before Year", [2019, 2020, 2021, 2022])
+    year_after = st.selectbox("After Year", [2023, 2024, 2025])
 
     st.subheader("🔬 Analysis Sensitivity")
-    ndvi_thresh = st.slider("Vegetation change threshold", 0.1, 0.4, 0.2)
-    ndbi_thresh = st.slider("Urban growth threshold", 0.1, 0.4, 0.2)
+    ndvi_thresh = st.slider("Vegetation Change Threshold", 0.1, 0.4, 0.2, 0.05)
+    ndbi_thresh = st.slider("Urban Growth Threshold", 0.1, 0.4, 0.2, 0.05)
 
-    st.subheader("🗺️ Basemap")
+    st.subheader("🗺️ Basemap Style")
     basemap = st.selectbox(
-        "Map style",
+        "Map Base",
         ["OpenStreetMap", "CartoDB Positron", "Stamen Terrain"]
     )
 
+    st.subheader("ℹ️ About")
+    st.caption(
+        "• Data: Sentinel-2 (ESA)\n"
+        "• Methods: NDVI, NDBI\n"
+        "• Context: ISRO / NRSC practices"
+    )
+
 # ==================================================
-# LOAD CITY & AUTO BBOX
+# LOAD CITY GEOJSON & AUTO BBOX
 # ==================================================
 @st.cache_data
 def load_city(path):
@@ -67,7 +78,7 @@ def load_city(path):
     return data, bbox
 
 # ==================================================
-# SATELLITE PROCESSING (ACCURATE)
+# SATELLITE ANALYSIS ENGINE (ACCURATE)
 # ==================================================
 @st.cache_data(show_spinner=False)
 def compute_change(bbox, y1, y2):
@@ -90,7 +101,7 @@ def compute_change(bbox, y1, y2):
                 1,
                 out_shape=(src.height // scale, src.width // scale),
                 resampling=Resampling.average
-            )
+            ).astype("float32")
 
     red_b, nir_b = read("B04", b, 4), read("B08", b, 4)
     red_a, nir_a = read("B04", a, 4), read("B08", a, 4)
@@ -109,14 +120,14 @@ def compute_change(bbox, y1, y2):
 # ==================================================
 # MASK → GEOJSON (SHADED & LIGHT)
 # ==================================================
-def mask_to_geojson(mask, bbox, color):
+def mask_to_geojson(mask, bbox, color, step=10):
     features = []
     h, w = mask.shape
     dx = (bbox[2] - bbox[0]) / w
     dy = (bbox[3] - bbox[1]) / h
 
-    for i in range(0, h, 12):
-        for j in range(0, w, 12):
+    for i in range(0, h, step):
+        for j in range(0, w, step):
             if mask[i, j]:
                 x = bbox[0] + j * dx
                 y = bbox[1] + i * dy
@@ -129,17 +140,23 @@ def mask_to_geojson(mask, bbox, color):
                 features.append({
                     "type": "Feature",
                     "geometry": mapping(poly),
-                    "properties": {"style": {"color": color, "fillOpacity": 0.6}}
+                    "properties": {
+                        "style": {
+                            "color": color,
+                            "fillOpacity": 0.6,
+                            "weight": 0
+                        }
+                    }
                 })
 
     return {"type": "FeatureCollection", "features": features}
 
 # ==================================================
-# RUN PIPELINE
+# PIPELINE
 # ==================================================
 boundary, bbox = load_city(CITY_FILES[city])
 
-with st.spinner("Generating real-time layers…"):
+with st.spinner("Running automated satellite analysis…"):
     ndvi_change, ndbi_change = compute_change(bbox, year_before, year_after)
 
 veg_loss = ndvi_change < -ndvi_thresh
@@ -151,7 +168,7 @@ veg_gain_geo = mask_to_geojson(veg_gain, bbox, "#1a9850")
 urban_geo = mask_to_geojson(urban, bbox, "#fdae61")
 
 # ==================================================
-# INTERACTIVE MAP
+# INTERACTIVE MAP (CORE DASHBOARD)
 # ==================================================
 m = leafmap.Map(
     center=[(bbox[1]+bbox[3])/2, (bbox[0]+bbox[2])/2],
@@ -165,23 +182,23 @@ m.add_geojson(veg_gain_geo, layer_name="Vegetation Gain")
 m.add_geojson(urban_geo, layer_name="New Buildings & Roads")
 
 m.add_layer_control()
-m.to_streamlit(height=600)
+m.to_streamlit(height=650)
 
 # ==================================================
-# ANALYTICS PANEL
+# ANALYTICS
 # ==================================================
-st.subheader("📊 Data Analysis")
+st.subheader("📊 Analytical Insights")
 
-total = ndvi_change.size
-col1, col2, col3 = st.columns(3)
+pixel_area_km2 = ((bbox[2]-bbox[0])*(bbox[3]-bbox[1])) / ndvi_change.size * 12365
 
-col1.metric("Vegetation Loss (%)", f"{np.mean(veg_loss)*100:.2f}%")
-col2.metric("Vegetation Gain (%)", f"{np.mean(veg_gain)*100:.2f}%")
-col3.metric("Urban Expansion (%)", f"{np.mean(urban)*100:.2f}%")
+c1, c2, c3 = st.columns(3)
+c1.metric("Vegetation Loss (%)", f"{np.mean(veg_loss)*100:.2f}%")
+c2.metric("Vegetation Gain (%)", f"{np.mean(veg_gain)*100:.2f}%")
+c3.metric("Urban Expansion (%)", f"{np.mean(urban)*100:.2f}%")
 
 st.markdown("""
-### 🧭 Legend
-- 🔴 Dark red shades → Vegetation loss  
+### 🗺️ Legend
+- 🔴 Red shades → Vegetation loss  
 - 🟢 Green shades → Vegetation gain  
 - 🟠 Orange shades → New buildings & road expansion  
 
@@ -189,7 +206,7 @@ st.markdown("""
 - Sentinel-2 Level-2A (ESA Copernicus)
 - NDVI & NDBI indices
 - Indian municipal boundaries (Datameet)
-- ISRO / NRSC urban remote-sensing practices
+- ISRO / NRSC urban remote-sensing methodologies
 """)
 
-st.success("✅ Advanced mobile-friendly GIS dashboard ready")
+st.success("✅ Advanced GIS dashboard ready for evaluation")
