@@ -1,4 +1,4 @@
-## 🗺️ Automated Change Mapping for Urban India
+# 🗺️ Automated Change Mapping for Urban India
 
 ### *Mapathon 2025 Submission*
 
