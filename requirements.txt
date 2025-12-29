@@ -4,4 +4,5 @@ rasterio
 pystac-client
 planetary-computer
 leafmap
-xarray
+shapely
+
