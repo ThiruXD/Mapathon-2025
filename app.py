@@ -11,34 +11,55 @@ import json
 # PAGE CONFIG
 # ==================================================
 st.set_page_config(layout="centered")
-st.title("🌍 Chennai Land & Urban Change Detection")
+st.title("🌍 Automated Land & Urban Change Detection (India)")
 st.caption("Python-based satellite analytics using open Sentinel-2 data")
 
 st.info(
-    "This application demonstrates vegetation and urban change in Chennai "
-    "using open satellite data. Optimized for fast cloud execution."
+    "Select any city boundary. Satellite data, analysis, and visuals "
+    "are generated automatically."
 )
 
 # ==================================================
-# CHENNAI BOUNDING BOX
+# CITY CONFIGURATION
 # ==================================================
-CHENNAI_BBOX = [80.20, 12.90, 80.35, 13.15]
+CITY_FILES = {
+    "Chennai": "geojson/chennai_boundary.geojson",
+    "Coimbatore": "geojson/coimbatore_boundary.geojson"
+}
 
 # ==================================================
-# LOAD CHENNAI BOUNDARY (LIGHTWEIGHT)
+# LOAD & PROCESS GEOJSON
 # ==================================================
 @st.cache_data
-def load_boundary():
-    with open("chennai_boundary.geojson") as f:
-        return json.load(f)
+def load_city_geojson(path):
+    with open(path) as f:
+        data = json.load(f)
 
-boundary = load_boundary()
+    rings = []
+    lons, lats = [], []
+
+    for feat in data["features"]:
+        geom = feat["geometry"]
+
+        if geom["type"] == "Polygon":
+            coords = geom["coordinates"][0]
+        else:  # MultiPolygon
+            coords = geom["coordinates"][0][0]
+
+        rings.append(coords)
+
+        for c in coords:
+            lons.append(c[0])
+            lats.append(c[1])
+
+    bbox = [min(lons), min(lats), max(lons), max(lats)]
+    return rings, bbox
 
 # ==================================================
-# SATELLITE PROCESSING (STABLE CORE)
+# SATELLITE PROCESSING (CORE ENGINE)
 # ==================================================
 @st.cache_data(show_spinner=False)
-def compute_change(year_before, year_after):
+def compute_change(bbox, year_before, year_after):
     catalog = Client.open(
         "https://planetarycomputer.microsoft.com/api/stac/v1"
     )
@@ -46,7 +67,7 @@ def compute_change(year_before, year_after):
     def get_scene(year):
         search = catalog.search(
             collections=["sentinel-2-l2a"],
-            bbox=CHENNAI_BBOX,
+            bbox=bbox,
             datetime=f"{year}-01-01/{year}-12-31",
             query={"eo:cloud_cover": {"lt": 10}}
         )
@@ -63,12 +84,12 @@ def compute_change(year_before, year_after):
                 resampling=Resampling.average
             ).astype("float32")
 
-    # ---- BEFORE
+    # BEFORE
     red_b = read("B04", item_b, 4)
     nir_b = read("B08", item_b, 4)
     swir_b = read("B11", item_b, 8)
 
-    # ---- AFTER
+    # AFTER
     red_a = read("B04", item_a, 4)
     nir_a = read("B08", item_a, 4)
     swir_a = read("B11", item_a, 8)
@@ -88,74 +109,82 @@ def compute_change(year_before, year_after):
 # ==================================================
 # USER INPUT
 # ==================================================
-year_before = st.selectbox("Before year", [2019, 2020, 2021, 2022])
-year_after = st.selectbox("After year", [2023, 2024, 2025])
+city = st.selectbox("Select City", list(CITY_FILES.keys()))
+year_before = st.selectbox("Before Year", [2019, 2020, 2021, 2022])
+year_after = st.selectbox("After Year", [2023, 2024, 2025])
 
-with st.spinner("Processing satellite data…"):
+wards, bbox = load_city_geojson(CITY_FILES[city])
+
+with st.spinner("Processing satellite data automatically..."):
     ndvi_before, ndvi_after, veg_change, urban_change = compute_change(
-        year_before, year_after
+        bbox, year_before, year_after
     )
 
 # ==================================================
-# CHENNAI BOUNDARY VISUAL (SAFE)
+# NDVI BEFORE / AFTER TOGGLE
 # ==================================================
-st.subheader("🗺️ Chennai Administrative Boundary")
+st.subheader("🖼️ NDVI Before / After")
 
-fig_b, ax_b = plt.subplots()
-for feat in boundary["features"]:
-    coords = feat["geometry"]["coordinates"][0]
-    ax_b.plot([c[0] for c in coords], [c[1] for c in coords], color="blue")
-ax_b.set_xlabel("Longitude")
-ax_b.set_ylabel("Latitude")
-ax_b.set_title("Chennai District Boundary")
-st.pyplot(fig_b)
-plt.close(fig_b)
+view = st.radio("View", ["Before", "After"], horizontal=True)
 
-# ==================================================
-# BEFORE / AFTER TOGGLE (SAFE)
-# ==================================================
-st.subheader("🖼️ Before / After NDVI View")
-
-view = st.radio("Select view", ["Before", "After"], horizontal=True)
-
-fig_ndvi, ax_ndvi = plt.subplots()
+fig0, ax0 = plt.subplots()
 if view == "Before":
-    ax_ndvi.imshow(ndvi_before, cmap="YlGn", vmin=-0.2, vmax=0.8)
-    ax_ndvi.set_title(f"NDVI – {year_before}")
+    ax0.imshow(ndvi_before, cmap="YlGn", vmin=-0.2, vmax=0.8)
+    ax0.set_title(f"{city} NDVI – {year_before}")
 else:
-    ax_ndvi.imshow(ndvi_after, cmap="YlGn", vmin=-0.2, vmax=0.8)
-    ax_ndvi.set_title(f"NDVI – {year_after}")
+    ax0.imshow(ndvi_after, cmap="YlGn", vmin=-0.2, vmax=0.8)
+    ax0.set_title(f"{city} NDVI – {year_after}")
 
-ax_ndvi.axis("off")
-st.pyplot(fig_ndvi)
-plt.close(fig_ndvi)
+ax0.axis("off")
+st.pyplot(fig0)
+plt.close(fig0)
 
 # ==================================================
-# VEGETATION CHANGE MAP
+# VEGETATION CHANGE + BOUNDARY
 # ==================================================
-st.subheader("🌱 Vegetation Change (NDVI Difference)")
+st.subheader("🌱 Vegetation Change with Ward Overlay")
 
-fig1, ax1 = plt.subplots()
+fig1, ax1 = plt.subplots(figsize=(6, 6))
 ax1.imshow(veg_change, cmap="RdYlGn", vmin=-0.4, vmax=0.4)
+
+for ring in wards:
+    ax1.plot(
+        [c[0] for c in ring],
+        [c[1] for c in ring],
+        color="black",
+        linewidth=0.25
+    )
+
+ax1.set_title(f"{city} Vegetation Change (NDVI)")
 ax1.axis("off")
 st.pyplot(fig1)
 plt.close(fig1)
 
 # ==================================================
-# URBAN CHANGE MAP (ROADS + BUILDINGS)
+# URBAN CHANGE + BOUNDARY
 # ==================================================
-st.subheader("🏗️ Urban Expansion (Buildings & Roads – NDBI)")
+st.subheader("🏗️ Urban Growth (Buildings & Roads)")
 
-fig2, ax2 = plt.subplots()
+fig2, ax2 = plt.subplots(figsize=(6, 6))
 ax2.imshow(urban_change, cmap="inferno", vmin=-0.3, vmax=0.3)
+
+for ring in wards:
+    ax2.plot(
+        [c[0] for c in ring],
+        [c[1] for c in ring],
+        color="white",
+        linewidth=0.25
+    )
+
+ax2.set_title(f"{city} Urban Expansion (NDBI)")
 ax2.axis("off")
 st.pyplot(fig2)
 plt.close(fig2)
 
 # ==================================================
-# CLASSIFIED MAPS (ADVANCED IMAGE)
+# CLASSIFIED MAP
 # ==================================================
-st.subheader("📌 Classified Change Map")
+st.subheader("📌 Classified Vegetation Change")
 
 classified = np.zeros(veg_change.shape)
 classified[veg_change < -0.2] = -1
@@ -168,9 +197,9 @@ st.pyplot(fig3)
 plt.close(fig3)
 
 # ==================================================
-# ADVANCED ANALYTICS
+# ANALYTICS
 # ==================================================
-st.subheader("📊 Analytics Summary")
+st.subheader("📊 Automatic Analytics")
 
 total = veg_change.size
 veg_loss = np.sum(veg_change < -0.2)
@@ -180,16 +209,16 @@ urban_growth = np.sum(urban_change > 0.2)
 c1, c2, c3 = st.columns(3)
 c1.metric("Vegetation Loss (%)", f"{veg_loss/total*100:.2f}%")
 c2.metric("Vegetation Gain (%)", f"{veg_gain/total*100:.2f}%")
-c3.metric("Urban Expansion (%)", f"{urban_growth/total*100:.2f}%")
+c3.metric("Urban Growth (%)", f"{urban_growth/total*100:.2f}%")
 
 st.bar_chart({
     "Vegetation Loss": veg_loss,
     "Vegetation Gain": veg_gain,
-    "Urban Expansion": urban_growth
+    "Urban Growth": urban_growth
 })
 
 # ==================================================
-# ISRO / NRSC CITATION
+# REFERENCES
 # ==================================================
 st.divider()
 st.subheader("📚 Data Sources & References")
@@ -199,12 +228,12 @@ st.markdown("""
 - Sentinel-2 Level-2A (ESA Copernicus Programme)
 
 **Indian Remote Sensing Context**
-- Indian Space Research Organisation (ISRO)
-- National Remote Sensing Centre (NRSC), Hyderabad
+- ISRO
+- NRSC, Hyderabad
 
 **Methods**
 - NDVI for vegetation monitoring  
 - NDBI for urban (roads & buildings) expansion
 """)
 
-st.success("✅ Analysis completed successfully and stably")
+st.success("✅ Fully automated analysis completed successfully")
