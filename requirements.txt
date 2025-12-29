@@ -4,5 +4,3 @@ matplotlib
 rasterio
 pystac-client
 planetary-computer
-shapely
-pyproj
