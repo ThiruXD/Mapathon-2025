@@ -19,8 +19,8 @@ st.set_page_config(
 
 st.title("🌍 Urban & Environmental Intelligence Dashboard")
 st.caption(
-    "Satellite-based land-use change detection (NDVI & NDBI) "
-    "with ward-level analytics and hotspot detection"
+    "Ward-level vegetation loss, urban expansion, rankings, and hotspot detection "
+    "using Sentinel-2 satellite imagery"
 )
 
 # ==================================================
@@ -42,7 +42,7 @@ with st.sidebar:
     ndbi_thresh = st.slider("Urban growth threshold (NDBI)", 0.1, 0.4, 0.2, 0.05)
 
 # ==================================================
-# LOAD CITY GEOJSON & BBOX
+# LOAD CITY GEOJSON & AUTO BBOX
 # ==================================================
 @st.cache_data
 def load_city(path):
@@ -60,25 +60,27 @@ def load_city(path):
     lons = [c[0] for c in coords]
     lats = [c[1] for c in coords]
     bbox = [min(lons), min(lats), max(lons), max(lats)]
+
     return data, bbox
 
 # ==================================================
-# SATELLITE PROCESSING
+# SATELLITE PROCESSING (NDVI / NDBI)
 # ==================================================
 @st.cache_data(show_spinner=False)
 def compute_change(bbox, y1, y2):
     catalog = Client.open("https://planetarycomputer.microsoft.com/api/stac/v1")
 
     def scene(year):
-        s = catalog.search(
+        search = catalog.search(
             collections=["sentinel-2-l2a"],
             bbox=bbox,
             datetime=f"{year}-01-01/{year}-12-31",
             query={"eo:cloud_cover": {"lt": 10}},
         )
-        return pc.sign(list(s.items())[0])
+        return pc.sign(list(search.items())[0])
 
-    before, after = scene(y1), scene(y2)
+    before = scene(y1)
+    after = scene(y2)
 
     def read(band, item, scale):
         with rasterio.open(item.assets[band].href) as src:
@@ -92,8 +94,8 @@ def compute_change(bbox, y1, y2):
     red_a, nir_a = read("B04", after, 4), read("B08", after, 4)
     swir_b, swir_a = read("B11", before, 8), read("B11", after, 8)
 
-    ndvi_change = (nir_a - red_a)/(nir_a + red_a + 1e-10) - (
-        (nir_b - red_b)/(nir_b + red_b + 1e-10)
+    ndvi_change = (nir_a - red_a) / (nir_a + red_a + 1e-10) - (
+        (nir_b - red_b) / (nir_b + red_b + 1e-10)
     )
 
     ndbi_change = (swir_a - nir_a[:swir_a.shape[0], :swir_a.shape[1]]) / (
@@ -112,7 +114,24 @@ def safe_percent(mask):
     return (np.count_nonzero(mask) / mask.size) * 100 if mask.size else 0.0
 
 # ==================================================
-# WARD ANALYTICS + HOTSPOTS
+# ROBUST WARD NAME EXTRACTOR
+# ==================================================
+def get_ward_name(props):
+    for key in [
+        "ward_name", "WARD_NAME", "wardname", "division",
+        "ward_no", "WARD_NO", "wardnumber", "ward_id", "Ward_No"
+    ]:
+        if key in props and props[key] not in [None, ""]:
+            return str(props[key])
+
+    for k, v in props.items():
+        if "ward" in k.lower():
+            return str(v)
+
+    return "Unknown"
+
+# ==================================================
+# WARD ANALYTICS + POPUPS
 # ==================================================
 def analyze_wards(boundary, ndvi, ndbi, bbox):
     hv, wv = ndvi.shape
@@ -141,7 +160,8 @@ def analyze_wards(boundary, ndvi, ndbi, bbox):
         veg_loss = safe_percent(zone_ndvi < -ndvi_thresh)
         urban = safe_percent(zone_ndbi > ndbi_thresh)
 
-        ward_name = feat.get("properties", {}).get("ward_no", "Unknown")
+        props = feat.get("properties", {})
+        ward_name = get_ward_name(props)
 
         rows.append({
             "Ward": ward_name,
@@ -160,23 +180,22 @@ def analyze_wards(boundary, ndvi, ndbi, bbox):
     return pd.DataFrame(rows), {"type": "FeatureCollection", "features": features}
 
 # ==================================================
-# RUN
+# RUN PIPELINE
 # ==================================================
 boundary, bbox = load_city(CITY_FILES[city])
-ndvi_change, ndbi_change = compute_change(bbox, year-1, year)
-
+ndvi_change, ndbi_change = compute_change(bbox, year - 1, year)
 ward_df, ward_geo = analyze_wards(boundary, ndvi_change, ndbi_change, bbox)
 
 # ==================================================
 # MAP (OPENSTREETMAP DEFAULT)
 # ==================================================
 m = leafmap.Map(
-    center=[(bbox[1]+bbox[3])/2, (bbox[0]+bbox[2])/2],
+    center=[(bbox[1] + bbox[3]) / 2, (bbox[0] + bbox[2]) / 2],
     zoom=11,
-    tiles="OpenStreetMap.Mapnik"
+    tiles="OpenStreetMap.Mapnik",
 )
 
-m.add_geojson(ward_geo, layer_name="Wards (Click)")
+m.add_geojson(ward_geo, layer_name="Wards (Click for details)")
 m.add_layer_control()
 m.to_streamlit(height=420)
 
@@ -186,8 +205,8 @@ m.to_streamlit(height=420)
 st.subheader("📊 City-Level KPIs")
 
 c1, c2 = st.columns(2)
-c1.metric("Avg Vegetation Loss (%)", f"{ward_df['Vegetation Loss (%)'].mean():.2f}")
-c2.metric("Avg Urban Expansion (%)", f"{ward_df['Urban Expansion (%)'].mean():.2f}")
+c1.metric("Average Vegetation Loss (%)", f"{ward_df['Vegetation Loss (%)'].mean():.2f}")
+c2.metric("Average Urban Expansion (%)", f"{ward_df['Urban Expansion (%)'].mean():.2f}")
 
 # ==================================================
 # WARD RANKINGS
@@ -201,12 +220,16 @@ st.markdown("### 🏗️ Top 10 Urban Expansion Wards")
 st.dataframe(ward_df.sort_values("Urban Expansion (%)", ascending=False).head(10))
 
 # ==================================================
-# HOTSPOTS
+# HOTSPOT DETECTION
 # ==================================================
-st.subheader("🔥 Hotspot Detection")
+st.subheader("🔥 Hotspot Detection (Top 10%)")
 
-veg_hotspots = ward_df[ward_df["Vegetation Loss (%)"] > ward_df["Vegetation Loss (%)"].quantile(0.9)]
-urban_hotspots = ward_df[ward_df["Urban Expansion (%)"] > ward_df["Urban Expansion (%)"].quantile(0.9)]
+veg_hotspots = ward_df[
+    ward_df["Vegetation Loss (%)"] > ward_df["Vegetation Loss (%)"].quantile(0.9)
+]
+urban_hotspots = ward_df[
+    ward_df["Urban Expansion (%)"] > ward_df["Urban Expansion (%)"].quantile(0.9)
+]
 
 st.markdown("### Vegetation Loss Hotspots")
 st.dataframe(veg_hotspots)
@@ -215,14 +238,33 @@ st.markdown("### Urban Expansion Hotspots")
 st.dataframe(urban_hotspots)
 
 # ==================================================
+# WARD-WISE CHARTS (NEW)
+# ==================================================
+st.subheader("📈 Ward-wise Charts")
+
+top_veg = ward_df.sort_values("Vegetation Loss (%)", ascending=False).head(10)
+top_urban = ward_df.sort_values("Urban Expansion (%)", ascending=False).head(10)
+
+st.markdown("### Vegetation Loss by Ward (Top 10)")
+st.bar_chart(top_veg.set_index("Ward")["Vegetation Loss (%)"])
+
+st.markdown("### Urban Expansion by Ward (Top 10)")
+st.bar_chart(top_urban.set_index("Ward")["Urban Expansion (%)"])
+
+# ==================================================
 # DOWNLOAD
 # ==================================================
 st.subheader("⬇️ Download")
 
-st.download_button("Download Ward Analytics (CSV)", ward_df.to_csv(index=False), "ward_analytics.csv")
+st.download_button(
+    "Download Ward Analytics (CSV)",
+    ward_df.to_csv(index=False),
+    "ward_analytics.csv",
+)
+
 st.download_button(
     "Download Ward GeoJSON",
     json.dumps(ward_geo),
     "ward_analysis.geojson",
-    "application/geo+json"
+    "application/geo+json",
 )
