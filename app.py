@@ -14,12 +14,12 @@ import pandas as pd
 # ==================================================
 st.set_page_config(
     page_title="Urban & Environmental Intelligence Dashboard",
-    layout="wide",
+    layout="wide"
 )
 
 st.title("🌍 Urban & Environmental Intelligence Dashboard")
 st.caption(
-    "Satellite-based land-use change detection + transport reference layers "
+    "Satellite-based land-use change detection + OpenStreetMap transport reference layers "
     "(Vegetation • Urban • Roads / Rail / Metro)"
 )
 
@@ -41,18 +41,21 @@ with st.sidebar:
     ndvi_thresh = st.slider("Vegetation threshold (NDVI)", 0.1, 0.4, 0.2, 0.05)
     ndbi_thresh = st.slider("Urban threshold (NDBI)", 0.1, 0.4, 0.2, 0.05)
 
-    basemap_analysis = st.selectbox(
+    analysis_basemap = st.selectbox(
         "Analysis Map Basemap",
-        ["OpenStreetMap", "CartoDB Positron"],
+        ["CartoDB Positron", "OpenStreetMap"]
     )
 
-    basemap_transport = st.selectbox(
-        "Transport Map Basemap",
-        ["OpenStreetMap (Roads)", "CartoDB Voyager (Transport)"],
+    transport_basemap = st.selectbox(
+        "Transport Map Basemap (OpenStreetMap)",
+        [
+            "OpenStreetMap Standard",
+            "CartoDB Voyager (Transport)",
+        ]
     )
 
 # ==================================================
-# BASEMAP DICTS (SAFE)
+# BASEMAP DICTS
 # ==================================================
 ANALYSIS_BASEMAPS = {
     "OpenStreetMap": "OpenStreetMap.Mapnik",
@@ -60,12 +63,12 @@ ANALYSIS_BASEMAPS = {
 }
 
 TRANSPORT_BASEMAPS = {
-    "OpenStreetMap (Roads)": "OpenStreetMap.Mapnik",
+    "OpenStreetMap Standard": "OpenStreetMap.Mapnik",
     "CartoDB Voyager (Transport)": "CartoDB Voyager",
 }
 
 # ==================================================
-# LOAD CITY GEOJSON + BBOX
+# LOAD CITY GEOJSON & AUTO BBOX
 # ==================================================
 @st.cache_data
 def load_city(path):
@@ -74,11 +77,11 @@ def load_city(path):
 
     coords = []
     for feat in data["features"]:
-        g = feat["geometry"]
-        if g["type"] == "Polygon":
-            coords += g["coordinates"][0]
+        geom = feat["geometry"]
+        if geom["type"] == "Polygon":
+            coords += geom["coordinates"][0]
         else:
-            coords += g["coordinates"][0][0]
+            coords += geom["coordinates"][0][0]
 
     lons = [c[0] for c in coords]
     lats = [c[1] for c in coords]
@@ -87,22 +90,23 @@ def load_city(path):
     return data, bbox
 
 # ==================================================
-# SATELLITE PROCESSING
+# SATELLITE PROCESSING (SENTINEL-2)
 # ==================================================
 @st.cache_data(show_spinner=False)
 def compute_change(bbox, y1, y2):
     catalog = Client.open("https://planetarycomputer.microsoft.com/api/stac/v1")
 
-    def scene(year):
-        s = catalog.search(
+    def get_scene(year):
+        search = catalog.search(
             collections=["sentinel-2-l2a"],
             bbox=bbox,
             datetime=f"{year}-01-01/{year}-12-31",
             query={"eo:cloud_cover": {"lt": 10}},
         )
-        return pc.sign(list(s.items())[0])
+        return pc.sign(list(search.items())[0])
 
-    b, a = scene(y1), scene(y2)
+    before = get_scene(y1)
+    after = get_scene(y2)
 
     def read(band, item, scale):
         with rasterio.open(item.assets[band].href) as src:
@@ -112,19 +116,19 @@ def compute_change(bbox, y1, y2):
                 resampling=Resampling.average,
             ).astype("float32")
 
-    red_b, nir_b = read("B04", b, 4), read("B08", b, 4)
-    red_a, nir_a = read("B04", a, 4), read("B08", a, 4)
-    swir_b, swir_a = read("B11", b, 8), read("B11", a, 8)
+    red_b, nir_b = read("B04", before, 4), read("B08", before, 4)
+    red_a, nir_a = read("B04", after, 4), read("B08", after, 4)
+    swir_b, swir_a = read("B11", before, 8), read("B11", after, 8)
 
-    ndvi_change = (nir_a - red_a) / (nir_a + red_a + 1e-10) - (
-        (nir_b - red_b) / (nir_b + red_b + 1e-10)
+    ndvi_change = (nir_a - red_a)/(nir_a + red_a + 1e-10) - (
+        (nir_b - red_b)/(nir_b + red_b + 1e-10)
     )
 
-    ndbi_change = (swir_a - nir_a[: swir_a.shape[0], : swir_a.shape[1]]) / (
-        swir_a + nir_a[: swir_a.shape[0], : swir_a.shape[1]] + 1e-10
+    ndbi_change = (swir_a - nir_a[:swir_a.shape[0], :swir_a.shape[1]]) / (
+        swir_a + nir_a[:swir_a.shape[0], :swir_a.shape[1]] + 1e-10
     ) - (
-        (swir_b - nir_b[: swir_b.shape[0], : swir_b.shape[1]])
-        / (swir_b + nir_b[: swir_b.shape[0], : swir_b.shape[1]] + 1e-10)
+        (swir_b - nir_b[:swir_b.shape[0], :swir_b.shape[1]]) /
+        (swir_b + nir_b[:swir_b.shape[0], :swir_b.shape[1]] + 1e-10)
     )
 
     return ndvi_change, ndbi_change
@@ -136,29 +140,29 @@ def safe_percent(mask):
     return (np.count_nonzero(mask) / mask.size) * 100 if mask.size else 0.0
 
 # ==================================================
-# WARD POPUPS
+# WARD-WISE POPUPS (URBAN FIXED)
 # ==================================================
 def build_ward_geojson(boundary, ndvi, ndbi, bbox):
-    h_v, w_v = ndvi.shape
-    h_u, w_u = ndbi.shape
+    hv, wv = ndvi.shape
+    hu, wu = ndbi.shape
     features = []
 
     for feat in boundary["features"]:
         poly = shape(feat["geometry"])
         minx, miny, maxx, maxy = poly.bounds
 
-        x0v = int((minx - bbox[0]) / (bbox[2] - bbox[0]) * w_v)
-        x1v = int((maxx - bbox[0]) / (bbox[2] - bbox[0]) * w_v)
-        y0v = int((miny - bbox[1]) / (bbox[3] - bbox[1]) * h_v)
-        y1v = int((maxy - bbox[1]) / (bbox[3] - bbox[1]) * h_v)
+        x0v = int((minx - bbox[0]) / (bbox[2] - bbox[0]) * wv)
+        x1v = int((maxx - bbox[0]) / (bbox[2] - bbox[0]) * wv)
+        y0v = int((miny - bbox[1]) / (bbox[3] - bbox[1]) * hv)
+        y1v = int((maxy - bbox[1]) / (bbox[3] - bbox[1]) * hv)
 
-        x0u = int((minx - bbox[0]) / (bbox[2] - bbox[0]) * w_u)
-        x1u = int((maxx - bbox[0]) / (bbox[2] - bbox[0]) * w_u)
-        y0u = int((miny - bbox[1]) / (bbox[3] - bbox[1]) * h_u)
-        y1u = int((maxy - bbox[1]) / (bbox[3] - bbox[1]) * h_u)
+        x0u = int((minx - bbox[0]) / (bbox[2] - bbox[0]) * wu)
+        x1u = int((maxx - bbox[0]) / (bbox[2] - bbox[0]) * wu)
+        y0u = int((miny - bbox[1]) / (bbox[3] - bbox[1]) * hu)
+        y1u = int((maxy - bbox[1]) / (bbox[3] - bbox[1]) * hu)
 
-        zone_ndvi = ndvi[max(0,y0v):min(h_v,y1v), max(0,x0v):min(w_v,x1v)]
-        zone_ndbi = ndbi[max(0,y0u):min(h_u,y1u), max(0,x0u):min(w_u,x1u)]
+        zone_ndvi = ndvi[max(0,y0v):min(hv,y1v), max(0,x0v):min(wv,x1v)]
+        zone_ndbi = ndbi[max(0,y0u):min(hu,y1u), max(0,x0u):min(wu,x1u)]
 
         feat["properties"]["popup"] = (
             f"<b>Vegetation Loss:</b> {safe_percent(zone_ndvi < -ndvi_thresh):.2f}%<br>"
@@ -182,33 +186,44 @@ veg_gain = ndvi_change > ndvi_thresh
 urban = ndbi_change > ndbi_thresh
 
 # ==================================================
-# MAP 1: SATELLITE ANALYSIS
+# MAP 1: SATELLITE ANALYSIS MAP
 # ==================================================
 st.subheader("🛰️ Land-use Change Map")
 
-m1 = leafmap.Map(
+analysis_map = leafmap.Map(
     center=[(bbox[1]+bbox[3])/2, (bbox[0]+bbox[2])/2],
     zoom=11,
-    tiles=ANALYSIS_BASEMAPS[basemap_analysis],
+    tiles=ANALYSIS_BASEMAPS[analysis_basemap],
 )
 
-m1.add_geojson(ward_geo, layer_name="Wards (click for stats)")
-m1.add_layer_control()
-m1.to_streamlit(height=420)
+analysis_map.add_geojson(ward_geo, layer_name="Wards (click for stats)")
+analysis_map.add_layer_control()
+analysis_map.to_streamlit(height=420)
 
 # ==================================================
-# MAP 2: TRANSPORT INFRASTRUCTURE (REFERENCE)
+# MAP 2: TRANSPORT MAP (OPENSTREETMAP.ORG)
 # ==================================================
-st.subheader("🚦 Transport Infrastructure Map (Reference)")
+st.subheader("🚦 Transport Infrastructure Map (OpenStreetMap)")
 
-m2 = leafmap.Map(
+transport_map = leafmap.Map(
     center=[(bbox[1]+bbox[3])/2, (bbox[0]+bbox[2])/2],
     zoom=11,
-    tiles=TRANSPORT_BASEMAPS[basemap_transport],
 )
 
-m2.add_layer_control()
-m2.to_streamlit(height=420)
+transport_map.add_tile_layer(
+    url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
+    name="OpenStreetMap Standard",
+    attribution="© OpenStreetMap contributors"
+)
+
+transport_map.add_tile_layer(
+    url="https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}.png",
+    name="CartoDB Voyager (Transport)",
+    attribution="© OpenStreetMap contributors © CARTO"
+)
+
+transport_map.add_layer_control()
+transport_map.to_streamlit(height=420)
 
 # ==================================================
 # ANALYTICS
@@ -225,23 +240,21 @@ c3.metric("Urban Expansion (%)", f"{safe_percent(urban):.2f}%")
 # ==================================================
 st.subheader("⬇️ Download & Export")
 
-df = pd.DataFrame(
-    {
-        "Metric": ["Vegetation Loss", "Vegetation Gain", "Urban Expansion"],
-        "Percentage (%)": [
-            safe_percent(veg_loss),
-            safe_percent(veg_gain),
-            safe_percent(urban),
-        ],
-    }
-)
+df = pd.DataFrame({
+    "Metric": ["Vegetation Loss", "Vegetation Gain", "Urban Expansion"],
+    "Percentage (%)": [
+        safe_percent(veg_loss),
+        safe_percent(veg_gain),
+        safe_percent(urban),
+    ],
+})
 
 st.download_button("Download City Analytics (CSV)", df.to_csv(index=False), "city_analytics.csv")
 st.download_button(
     "Download Ward GeoJSON",
     json.dumps(ward_geo),
     "ward_analysis.geojson",
-    "application/geo+json",
+    "application/geo+json"
 )
 
-st.success("✅ All features stable. Transport map works without errors.")
+st.success("✅ All past features integrated successfully. OpenStreetMap transport map working.")
